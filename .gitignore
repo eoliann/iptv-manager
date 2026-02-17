@@ -1,1 +1,6 @@
 /target
+**/*.rs.bk
+Cargo.lock
+.vscode
+.idea
+iptv-manager.zip
