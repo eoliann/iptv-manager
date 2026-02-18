@@ -18,6 +18,7 @@ use std::{
 use uuid::Uuid;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, MoveWindow, ShowWindow, SW_HIDE, SW_SHOW, WS_CHILD,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
@@ -119,7 +120,7 @@ impl MpvPlayer {
                     0,
                     class_name.as_ptr(),
                     std::ptr::null(),
-                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | 0x100, // 0x100 = SS_NOTIFY
                     0,
                     0,
                     0,
@@ -581,7 +582,12 @@ impl App {
 
                 if current_status == MpvStatus::NotInstalled {
                     tx.send(JobMsg::Status("Pornesc mpv...".into())).ok();
-                    let _ = Command::new(exe).spawn();
+                    let _ = Command::new(exe)
+                        .arg("--osc=yes")
+                        .arg("--input-cursor=yes")
+                        .arg("--input-vo-keyboard=yes")
+                        .arg("--input-default-bindings=yes")
+                        .spawn();
                 }
 
                 tx.send(JobMsg::Done("Actualizare MPV finalizată.".into()))
@@ -791,6 +797,10 @@ impl App {
                     let mut cmd = Command::new(mpv_exe);
                     cmd.arg(playlist_path)
                        .arg("--force-window=yes")
+                       .arg("--osc=yes")
+                       .arg("--input-cursor=yes")
+                       .arg("--input-vo-keyboard=yes")
+                       .arg("--input-default-bindings=yes")
                        .arg(format!("--input-ipc-server={}", ipc_path));
 
                     if embedded {
@@ -1017,10 +1027,18 @@ impl eframe::App for App {
 
             if self.player.embedded && player_active {
                 let available = ui.available_size();
-                let (rect, _response) = ui.allocate_at_least(
+                let (rect, response) = ui.allocate_at_least(
                     egui::vec2(available.x, available.y.max(300.0)),
-                    egui::Sense::hover(),
+                    egui::Sense::click(),
                 );
+
+                if response.clicked() {
+                    if let Some(hwnd) = self.player.child_hwnd {
+                        unsafe {
+                            SetFocus(hwnd as _);
+                        }
+                    }
+                }
 
                 self.player.move_window(rect, ctx.pixels_per_point());
                 self.player.set_visible(true);
