@@ -584,6 +584,7 @@ impl App {
                     tx.send(JobMsg::Status("Pornesc mpv...".into())).ok();
                     let _ = Command::new(exe)
                         .arg("--osc=yes")
+                        .arg("--script-opts=osc-visibility=always")
                         .arg("--input-cursor=yes")
                         .arg("--input-vo-keyboard=yes")
                         .arg("--input-default-bindings=yes")
@@ -798,6 +799,7 @@ impl App {
                     cmd.arg(playlist_path)
                        .arg("--force-window=yes")
                        .arg("--osc=yes")
+                       .arg("--script-opts=osc-visibility=always")
                        .arg("--input-cursor=yes")
                        .arg("--input-vo-keyboard=yes")
                        .arg("--input-default-bindings=yes")
@@ -1047,12 +1049,14 @@ impl eframe::App for App {
             }
 
             ui.separator();
-
+            ui.add_space(4.0);
             let is_err = self.status.to_lowercase().contains("eroare");
             ui.colored_label(
                 if is_err { Color32::RED } else { Color32::GREEN },
                 &self.status,
             );
+            ui.add_space(4.0);
+            ui.separator();
         });
 
         // Dialog M3U (fără borrow conflict pe open)
