@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use eframe::egui;
-use egui::{Align2, Color32};
+use egui::{Align2, Color32, RichText};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -53,12 +53,22 @@ struct AppData {
 
 // ---------------------------- Background jobs ----------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MpvStatus {
+    Unknown,
+    Checking,
+    UpToDate,
+    UpdateAvailable,
+    NotInstalled,
+}
+
 #[derive(Debug, Clone)]
 enum JobMsg {
     Status(String),
     Progress { current: u64, total: Option<u64> },
     Done(String),
     Error(String),
+    MpvStatus(MpvStatus),
 }
 
 struct RunningJob {
@@ -72,6 +82,7 @@ struct App {
     data_path: PathBuf,
     playlists_dir: PathBuf,
     mpv_dir: PathBuf,
+    mpv_status: MpvStatus,
 
     selected_id: Option<String>,
 
@@ -116,11 +127,12 @@ impl App {
             .and_then(|s| serde_json::from_str::<AppData>(&s).ok())
             .unwrap_or_default();
 
-        Self {
+        let mut app = Self {
             data,
             data_path,
             playlists_dir,
             mpv_dir,
+            mpv_status: MpvStatus::Unknown,
 
             selected_id: None,
 
@@ -141,7 +153,9 @@ impl App {
             form_portal: String::new(),
             form_mac: String::new(),
             form_mag_pass: String::new(),
-        }
+        };
+        app.start_check_mpv_status();
+        app
     }
 
     // ---------------------------- helpers ----------------------------
@@ -349,6 +363,136 @@ impl App {
         thread::spawn(move || f(tx));
     }
 
+    fn start_check_mpv_status(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+
+        self.mpv_status = MpvStatus::Checking;
+        let mpv_dir = self.mpv_dir.clone();
+
+        self.start_job(move |tx| {
+            let res = (|| -> Result<()> {
+                let client = Self::http_client()?;
+                let (latest_version, _) = Self::fetch_latest_mpv_info(&client)?;
+
+                let mpv_exe = Self::mpv_exe_path(&mpv_dir);
+                if !mpv_exe.exists() {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::NotInstalled));
+                    return Ok(());
+                }
+
+                let installed_version =
+                    Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
+                if installed_version == latest_version {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate));
+                } else {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::UpdateAvailable));
+                }
+                Ok(())
+            })();
+
+            if let Err(_) = res {
+                let exe = Self::mpv_exe_path(&mpv_dir);
+                if !exe.exists() {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::NotInstalled));
+                } else {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::Unknown));
+                }
+            }
+        });
+    }
+
+    fn download_and_extract_mpv(
+        client: &Client,
+        download_url: &str,
+        mpv_dir: &Path,
+        latest_version: &str,
+        tx: &mpsc::Sender<JobMsg>,
+    ) -> Result<PathBuf> {
+        tx.send(JobMsg::Status(format!("Descarc mpv: {}...", latest_version)))
+            .ok();
+        fs::create_dir_all(mpv_dir)?;
+        let archive_path = mpv_dir.join("mpv.7z");
+
+        let mut resp = client.get(download_url).send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("HTTP {} la mpv", resp.status()));
+        }
+
+        let mut file = fs::File::create(&archive_path)?;
+        let total = resp.content_length();
+        let mut downloaded: u64 = 0;
+        let mut buf = [0u8; 64 * 1024];
+
+        while let Ok(n) = resp.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
+            downloaded += n as u64;
+            tx.send(JobMsg::Progress {
+                current: downloaded,
+                total,
+            })
+            .ok();
+        }
+
+        tx.send(JobMsg::Status("Extrag mpv...".into())).ok();
+        sevenz_rust::decompress_file(&archive_path, mpv_dir)
+            .map_err(|e| anyhow!("Eroare extragere: {e}"))?;
+
+        fs::remove_file(&archive_path).ok();
+        fs::write(Self::mpv_version_file(mpv_dir), latest_version).ok();
+        tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate)).ok();
+
+        Self::find_file_recursive(mpv_dir, "mpv.exe", 6)
+            .ok_or_else(|| anyhow!("Nu găsesc mpv.exe după extragere"))
+    }
+
+    fn start_mpv_maintenance_job(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+
+        let mpv_dir = self.mpv_dir.clone();
+        let current_status = self.mpv_status;
+
+        self.start_job(move |tx| {
+            if let Err(e) = (|| -> Result<()> {
+                let client = Self::http_client()?;
+
+                tx.send(JobMsg::Status("Caut ultima versiune mpv...".into()))
+                    .ok();
+                let (latest_version, download_url) = Self::fetch_latest_mpv_info(&client)?;
+
+                let mpv_exe = Self::mpv_exe_path(&mpv_dir);
+                let installed_version =
+                    Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
+
+                if mpv_exe.exists() && installed_version == latest_version {
+                    tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate)).ok();
+                    tx.send(JobMsg::Done("MPV este deja la zi.".into())).ok();
+                    return Ok(());
+                }
+
+                let exe =
+                    Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?;
+
+                if current_status == MpvStatus::NotInstalled {
+                    tx.send(JobMsg::Status("Pornesc mpv...".into())).ok();
+                    let _ = Command::new(exe).spawn();
+                }
+
+                tx.send(JobMsg::Done("Actualizare MPV finalizată.".into()))
+                    .ok();
+                Ok(())
+            })() {
+                tx.send(JobMsg::Error(e.to_string())).ok();
+            }
+        });
+    }
+
     fn poll_job_messages(&mut self) {
         // take ownership -> no borrow conflicts
         let job = match self.job.take() {
@@ -368,6 +512,7 @@ impl App {
                 }
                 JobMsg::Done(s) => done = Some(s),
                 JobMsg::Error(e) => err = Some(e),
+                JobMsg::MpvStatus(s) => self.mpv_status = s,
             }
         }
 
@@ -388,12 +533,13 @@ impl App {
         self.job = Some(job);
     }
 
-    fn fetch_latest_mpv_asset_url(client: &Client) -> Result<String> {
+    fn fetch_latest_mpv_info(client: &Client) -> Result<(String, String)> {
         let api_url = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest";
 
         let resp = client
             .get(api_url)
             .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "iptv-manager")
             .send()
             .context("Nu pot interoga GitHub API")?;
 
@@ -401,8 +547,7 @@ impl App {
             return Err(anyhow!("HTTP {} la GitHub API", resp.status()));
         }
 
-        let text = resp.text().context("Nu pot citi corpul răspunsului GitHub")?;
-        let json: serde_json::Value = serde_json::from_str(&text).context("JSON invalid GitHub")?;
+        let json: serde_json::Value = resp.json().context("JSON invalid GitHub")?;
 
         let assets = json["assets"]
             .as_array()
@@ -412,18 +557,8 @@ impl App {
             let name = asset["name"].as_str().unwrap_or("");
             let url = asset["browser_download_url"].as_str().unwrap_or("");
 
-            // if name.starts_with("mpv-")
-            //     && name.contains("x86_64")
-            //     && name.ends_with(".7z")
-            // {
-            //     return Ok(url.to_string());
-            // }
-            if name.starts_with("mpv-")
-                && !name.contains("ffmpeg")
-                && name.contains("x86_64")
-                && name.ends_with(".7z")
-            {
-                return Ok(url.to_string());
+            if name.contains("mpv-x86_64") && name.ends_with(".7z") && !name.contains("ffmpeg") {
+                return Ok((name.to_string(), url.to_string()));
             }
         }
 
@@ -503,93 +638,28 @@ impl App {
 
         self.start_job(move |tx| {
             if let Err(e) = (|| -> Result<()> {
+                let client = Self::http_client()?;
 
-                let client = Client::builder()
-                    .user_agent("iptv-manager")
-                    .build()?;
+                tx.send(JobMsg::Status("Verific mpv...".into())).ok();
+                let (latest_version, download_url) = Self::fetch_latest_mpv_info(&client)?;
 
-                tx.send(JobMsg::Status("Caut ultima versiune mpv...".into())).ok();
+                let mpv_exe_local = Self::mpv_exe_path(&mpv_dir);
+                let installed_version =
+                    Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
 
-                // 1️⃣ GitHub API latest release
-                let api_url = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest";
-
-                let release: serde_json::Value = client
-                    .get(api_url)
-                    .send()?
-                    .json()?;
-
-                let assets = release["assets"]
-                    .as_array()
-                    .ok_or_else(|| anyhow!("Nu pot citi assets din release"))?;
-
-                // 2️⃣ Caut asset corect
-                let mut download_url: Option<String> = None;
-
-                for asset in assets {
-                    if let Some(name) = asset["name"].as_str() {
-                        if name.contains("mpv-x86_64") && name.ends_with(".7z") {
-                            download_url = asset["browser_download_url"]
-                                .as_str()
-                                .map(|s| s.to_string());
-                            break;
-                        }
-                    }
-                }
-
-                let download_url = download_url
-                    .ok_or_else(|| anyhow!("Nu găsesc arhiva mpv-x86_64 în release"))?;
-
-                tx.send(JobMsg::Status("Descarc mpv...".into())).ok();
-
-                fs::create_dir_all(&mpv_dir)?;
-
-                let archive_path = mpv_dir.join("mpv.7z");
-
-                let mut resp = client.get(&download_url).send()?;
-
-                if !resp.status().is_success() {
-                    return Err(anyhow!("HTTP {} la mpv", resp.status()));
-                }
-
-                let mut file = fs::File::create(&archive_path)?;
-
-                let total = resp.content_length();
-                let mut downloaded: u64 = 0;
-                let mut buf = [0u8; 64 * 1024];
-
-                while let Ok(n) = resp.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    file.write_all(&buf[..n])?;
-                    downloaded += n as u64;
-
-                    tx.send(JobMsg::Progress {
-                        current: downloaded,
-                        total,
-                    }).ok();
-                }
-
-                tx.send(JobMsg::Status("Extrag mpv...".into())).ok();
-
-                sevenz_rust::decompress_file(&archive_path, &mpv_dir)
-                    .map_err(|e| anyhow!("Eroare extragere: {e}"))?;
-
-                fs::remove_file(&archive_path).ok();
-
-                // 3️⃣ Caut mpv.exe
-                let mpv_exe = Self::find_file_recursive(&mpv_dir, "mpv.exe", 6)
-                    .ok_or_else(|| anyhow!("Nu găsesc mpv.exe după extragere"))?;
+                let mpv_exe = if mpv_exe_local.exists() && installed_version == latest_version {
+                    mpv_exe_local
+                } else {
+                    Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?
+                };
 
                 tx.send(JobMsg::Status("Pornesc redarea...".into())).ok();
-
                 Command::new(mpv_exe)
                     .arg(playlist_path)
                     .arg("--force-window=yes")
                     .spawn()?;
 
                 tx.send(JobMsg::Done("Redare pornită.".into())).ok();
-
                 Ok(())
             })() {
                 tx.send(JobMsg::Error(e.to_string())).ok();
@@ -668,6 +738,30 @@ impl eframe::App for App {
                         ui.close_menu();
                     }
                 });
+
+                ui.separator();
+
+                let (btn_text, use_custom_style) = match self.mpv_status {
+                    MpvStatus::NotInstalled => ("Instalează MPV", true),
+                    MpvStatus::UpdateAvailable => ("Actualizează MPV", true),
+                    MpvStatus::Checking => ("Verificare MPV...", false),
+                    MpvStatus::UpToDate => ("MPV este la zi", false),
+                    MpvStatus::Unknown => ("Verifică MPV", false),
+                };
+
+                let mut btn = egui::Button::new(if use_custom_style {
+                    RichText::new(btn_text).color(Color32::BLACK)
+                } else {
+                    RichText::new(btn_text)
+                });
+
+                if use_custom_style {
+                    btn = btn.fill(Color32::GREEN);
+                }
+
+                if ui.add_enabled(!self.is_busy(), btn).clicked() {
+                    self.start_mpv_maintenance_job();
+                }
             });
         });
 
