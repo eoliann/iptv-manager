@@ -25,6 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE, WS_EX_CONTROLPARENT, SetWindowPos,
 };
 
+const SS_NOTIFY: u32 = 0x0100;
+
 // ---------------------------- Data model ----------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -128,7 +130,7 @@ impl MpvPlayer {
                     WS_EX_CONTROLPARENT,
                     class_name.as_ptr(),
                     std::ptr::null(),
-                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | SS_NOTIFY,
                     0,
                     0,
                     0,
@@ -583,21 +585,21 @@ impl App {
         }
 
         let mpv_dir = self.mpv_dir.clone();
-        let current_status = self.mpv_status;
 
         self.start_job(move |tx| {
             if let Err(e) = (|| -> Result<()> {
                 let client = Self::http_client()?;
 
-                tx.send(JobMsg::Status("Caut ultima versiune mpv...".into()))
-                    .ok();
-                let (latest_version, download_url) = Self::fetch_latest_mpv_info(&client)?;
+                tx.send(JobMsg::Status("Verific mpv...".into())).ok();
 
                 let mpv_exe = Self::mpv_exe_path(&mpv_dir);
+                let existed_before = mpv_exe.exists();
+
+                let (latest_version, download_url) = Self::fetch_latest_mpv_info(&client)?;
                 let installed_version =
                     Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
 
-                if mpv_exe.exists() && installed_version == latest_version {
+                if existed_before && installed_version == latest_version {
                     tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate)).ok();
                     tx.send(JobMsg::Done("MPV este deja la zi.".into())).ok();
                     return Ok(());
@@ -606,7 +608,8 @@ impl App {
                 let exe =
                     Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?;
 
-                if current_status == MpvStatus::NotInstalled {
+                // Daca nu era instalat, il rulam dupa descarcare
+                if !existed_before {
                     tx.send(JobMsg::Status("Pornesc mpv...".into())).ok();
                     let _ = Command::new(exe)
                         .arg("--osc=yes")
@@ -617,7 +620,7 @@ impl App {
                         .spawn();
                 }
 
-                tx.send(JobMsg::Done("Actualizare MPV finalizată.".into()))
+                tx.send(JobMsg::Done("Acțiune MPV finalizată.".into()))
                     .ok();
                 Ok(())
             })() {
