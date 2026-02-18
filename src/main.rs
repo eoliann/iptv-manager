@@ -8,14 +8,20 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     sync::mpsc,
     thread,
     time::Duration,
 };
 use uuid::Uuid;
-use std::io::{Read, Write};
+
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, MoveWindow, ShowWindow, SW_HIDE, SW_SHOW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+};
 
 // ---------------------------- Data model ----------------------------
 
@@ -62,13 +68,14 @@ enum MpvStatus {
     NotInstalled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum JobMsg {
     Status(String),
     Progress { current: u64, total: Option<u64> },
     Done(String),
     Error(String),
     MpvStatus(MpvStatus),
+    MpvStarted(Child),
 }
 
 struct RunningJob {
@@ -77,12 +84,103 @@ struct RunningJob {
 
 // ---------------------------- App state ----------------------------
 
+struct MpvPlayer {
+    child: Option<Child>,
+    child_hwnd: Option<isize>,
+    embedded: bool,
+    ipc_path: String,
+}
+
+impl MpvPlayer {
+    fn new() -> Self {
+        Self {
+            child: None,
+            child_hwnd: None,
+            embedded: true,
+            ipc_path: r"\\.\pipe\mpv-ipc".to_string(),
+        }
+    }
+
+    fn send_command(&self, cmd: &str) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.ipc_path)
+            .context("Nu pot deschide pipe-ul MPV")?;
+        file.write_all(cmd.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn ensure_child_window(&mut self, parent_hwnd: isize) {
+        if self.child_hwnd.is_none() {
+            unsafe {
+                let class_name: Vec<u16> = "Static\0".encode_utf16().collect();
+                let hwnd = CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    std::ptr::null(),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    0,
+                    0,
+                    0,
+                    0,
+                    parent_hwnd as _,
+                    0,
+                    0,
+                    std::ptr::null(),
+                );
+                if hwnd != 0 {
+                    self.child_hwnd = Some(hwnd as _);
+                }
+            }
+        }
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if let Some(hwnd) = self.child_hwnd {
+            unsafe {
+                ShowWindow(hwnd as _, if visible { SW_SHOW } else { SW_HIDE });
+            }
+        }
+    }
+
+    fn move_window(&self, rect: egui::Rect, pixels_per_point: f32) {
+        if let Some(hwnd) = self.child_hwnd {
+            unsafe {
+                MoveWindow(
+                    hwnd as _,
+                    (rect.min.x * pixels_per_point) as i32,
+                    (rect.min.y * pixels_per_point) as i32,
+                    (rect.width() * pixels_per_point) as i32,
+                    (rect.height() * pixels_per_point) as i32,
+                    1,
+                );
+            }
+        }
+    }
+
+    fn is_alive(&mut self) -> bool {
+        if let Some(child) = &mut self.child {
+            match child.try_wait() {
+                Ok(None) => true,
+                _ => {
+                    self.child = None;
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+}
+
 struct App {
     data: AppData,
     data_path: PathBuf,
     playlists_dir: PathBuf,
     mpv_dir: PathBuf,
     mpv_status: MpvStatus,
+    player: MpvPlayer,
 
     selected_id: Option<String>,
 
@@ -133,6 +231,7 @@ impl App {
             playlists_dir,
             mpv_dir,
             mpv_status: MpvStatus::Unknown,
+            player: MpvPlayer::new(),
 
             selected_id: None,
 
@@ -516,6 +615,7 @@ impl App {
                     JobMsg::Done(s) => done = Some(s),
                     JobMsg::Error(e) => err = Some(e),
                     JobMsg::MpvStatus(s) => self.mpv_status = s,
+                    JobMsg::MpvStarted(c) => self.player.child = Some(c),
                 },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -651,6 +751,12 @@ impl App {
             return;
         }
 
+        // Check if alive first (need to do it before moving player to thread)
+        let mut is_alive = self.player.is_alive();
+        let ipc_path = self.player.ipc_path.clone();
+        let embedded = self.player.embedded;
+        let wid = self.player.child_hwnd;
+
         self.start_job(move |tx| {
             if let Err(e) = (|| -> Result<()> {
                 let client = Self::http_client()?;
@@ -665,14 +771,37 @@ impl App {
                 let mpv_exe = if mpv_exe_local.exists() && installed_version == latest_version {
                     mpv_exe_local
                 } else {
-                    Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?
+                    let exe = Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?;
+                    is_alive = false; // forced new spawn if updated
+                    exe
                 };
 
-                tx.send(JobMsg::Status("Pornesc redarea...".into())).ok();
-                Command::new(mpv_exe)
-                    .arg(playlist_path)
-                    .arg("--force-window=yes")
-                    .spawn()?;
+                if is_alive {
+                    tx.send(JobMsg::Status("Încarc playlist în MPV existent...".into())).ok();
+                    let file_arg = playlist_path.to_string_lossy().replace("\\", "\\\\");
+                    let cmd = format!("{{\"command\": [\"loadfile\", \"{}\"]}}", file_arg);
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&ipc_path)
+                        .context("Nu pot deschide pipe-ul MPV")?;
+                    file.write_all(cmd.as_bytes())?;
+                    file.write_all(b"\n")?;
+                } else {
+                    tx.send(JobMsg::Status("Pornesc MPV...".into())).ok();
+                    let mut cmd = Command::new(mpv_exe);
+                    cmd.arg(playlist_path)
+                       .arg("--force-window=yes")
+                       .arg(format!("--input-ipc-server={}", ipc_path));
+
+                    if embedded {
+                        if let Some(w) = wid {
+                            cmd.arg(format!("--wid={}", w));
+                        }
+                    }
+
+                    let child = cmd.spawn()?;
+                    let _ = tx.send(JobMsg::MpvStarted(child));
+                }
 
                 tx.send(JobMsg::Done("Redare pornită.".into())).ok();
                 Ok(())
@@ -736,6 +865,13 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job_messages();
+
+        if let Ok(handle) = _frame.window_handle() {
+            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                let hwnd = h.hwnd.get();
+                self.player.ensure_child_window(hwnd);
+            }
+        }
 
         egui::TopBottomPanel::top("top_menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -826,6 +962,30 @@ impl eframe::App for App {
                     }
                 });
 
+                ui.separator();
+
+                if ui
+                    .button(if self.player.embedded {
+                        "Mod Extern"
+                    } else {
+                        "Mod Embed"
+                    })
+                    .clicked()
+                {
+                    self.player.embedded = !self.player.embedded;
+                    if let Some(hwnd) = self.player.child_hwnd {
+                        let wid = if self.player.embedded { hwnd } else { 0 };
+                        let _ = self.player.send_command(&format!(
+                            "{{\"command\": [\"set_property\", \"wid\", {}]}}",
+                            wid
+                        ));
+                    }
+                }
+
+                if ui.button("Fullscreen").clicked() {
+                    let _ = self.player.send_command("{\"command\": [\"cycle\", \"fullscreen\"]}");
+                }
+
                 if self.is_busy() {
                     ui.spinner();
                 }
@@ -849,6 +1009,23 @@ impl eframe::App for App {
                             .text(format!("{} MB", self.progress_current / 1_000_000)),
                     );
                 }
+            }
+
+            ui.separator();
+
+            let player_active = self.player.is_alive();
+
+            if self.player.embedded && player_active {
+                let available = ui.available_size();
+                let (rect, _response) = ui.allocate_at_least(
+                    egui::vec2(available.x, available.y.max(300.0)),
+                    egui::Sense::hover(),
+                );
+
+                self.player.move_window(rect, ctx.pixels_per_point());
+                self.player.set_visible(true);
+            } else {
+                self.player.set_visible(false);
             }
 
             ui.separator();
@@ -997,8 +1174,19 @@ impl eframe::App for App {
             }
         }
 
-        if self.is_busy() {
+        if self.is_busy() || self.player.is_alive() {
             ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut child) = self.player.child.take() {
+            let _ = child.kill();
+        }
+        if let Some(hwnd) = self.player.child_hwnd {
+            unsafe {
+                DestroyWindow(hwnd as _);
+            }
         }
     }
 }
