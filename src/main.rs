@@ -400,6 +400,7 @@ impl App {
                     let _ = tx.send(JobMsg::MpvStatus(MpvStatus::Unknown));
                 }
             }
+            let _ = tx.send(JobMsg::Done("Verificare MPV finalizată.".to_string()));
         });
     }
 
@@ -502,17 +503,25 @@ impl App {
 
         let mut done: Option<String> = None;
         let mut err: Option<String> = None;
+        let mut disconnected = false;
 
-        while let Ok(msg) = job.rx.try_recv() {
-            match msg {
-                JobMsg::Status(s) => self.status = s,
-                JobMsg::Progress { current, total } => {
-                    self.progress_current = current;
-                    self.progress_total = total;
+        loop {
+            match job.rx.try_recv() {
+                Ok(msg) => match msg {
+                    JobMsg::Status(s) => self.status = s,
+                    JobMsg::Progress { current, total } => {
+                        self.progress_current = current;
+                        self.progress_total = total;
+                    }
+                    JobMsg::Done(s) => done = Some(s),
+                    JobMsg::Error(e) => err = Some(e),
+                    JobMsg::MpvStatus(s) => self.mpv_status = s,
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
-                JobMsg::Done(s) => done = Some(s),
-                JobMsg::Error(e) => err = Some(e),
-                JobMsg::MpvStatus(s) => self.mpv_status = s,
             }
         }
 
@@ -525,6 +534,12 @@ impl App {
 
         if let Some(s) = done {
             self.status = s;
+            self.reset_progress();
+            self.job = None;
+            return;
+        }
+
+        if disconnected {
             self.reset_progress();
             self.job = None;
             return;
