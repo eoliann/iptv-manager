@@ -18,9 +18,10 @@ use std::{
 use uuid::Uuid;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, MoveWindow, ShowWindow, SW_HIDE, SW_SHOW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GetWindowLongW, MoveWindow, SetWindowLongW, ShowWindow, GWL_STYLE,
+    SW_HIDE, SW_SHOW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 // ---------------------------- Data model ----------------------------
@@ -90,6 +91,7 @@ struct MpvPlayer {
     embedded: bool,
     ipc_path: String,
     last_rect: Option<egui::Rect>,
+    last_ppp: Option<f32>,
     last_visible: bool,
 }
 
@@ -102,6 +104,7 @@ impl MpvPlayer {
             embedded: true,
             ipc_path: format!(r"\\.\pipe\mpv-ipc-{}", pipe_id),
             last_rect: None,
+            last_ppp: None,
             last_visible: false,
         }
     }
@@ -154,7 +157,7 @@ impl MpvPlayer {
     }
 
     fn move_window(&mut self, rect: egui::Rect, pixels_per_point: f32) {
-        if self.last_rect == Some(rect) {
+        if self.last_rect == Some(rect) && self.last_ppp == Some(pixels_per_point) {
             return;
         }
         if let Some(hwnd) = self.child_hwnd {
@@ -169,6 +172,7 @@ impl MpvPlayer {
                 );
             }
             self.last_rect = Some(rect);
+            self.last_ppp = Some(pixels_per_point);
         }
     }
 
@@ -894,6 +898,14 @@ impl eframe::App for App {
             if let RawWindowHandle::Win32(h) = handle.as_raw() {
                 let hwnd = h.hwnd.get();
                 self.player.ensure_child_window(hwnd);
+
+                // Add WS_CLIPCHILDREN to main window to prevent flickering and event issues
+                unsafe {
+                    let style = GetWindowLongW(hwnd as _, GWL_STYLE);
+                    if style & WS_CLIPCHILDREN as i32 == 0 {
+                        SetWindowLongW(hwnd as _, GWL_STYLE, style | WS_CLIPCHILDREN as i32);
+                    }
+                }
             }
         }
 
@@ -1045,6 +1057,14 @@ impl eframe::App for App {
                     egui::vec2(available.x, available.y.max(300.0)),
                     egui::Sense::hover(),
                 );
+
+                if ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_pressed()) {
+                    if let Some(hwnd) = self.player.child_hwnd {
+                        unsafe {
+                            SetFocus(hwnd as _);
+                        }
+                    }
+                }
 
                 self.player.move_window(rect, ctx.pixels_per_point());
                 self.player.set_visible(true);
