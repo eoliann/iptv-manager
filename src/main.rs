@@ -18,7 +18,6 @@ use std::{
 use uuid::Uuid;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, MoveWindow, ShowWindow, SW_HIDE, SW_SHOW, WS_CHILD,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
@@ -90,15 +89,20 @@ struct MpvPlayer {
     child_hwnd: Option<isize>,
     embedded: bool,
     ipc_path: String,
+    last_rect: Option<egui::Rect>,
+    last_visible: bool,
 }
 
 impl MpvPlayer {
     fn new() -> Self {
+        let pipe_id = Uuid::new_v4().to_string();
         Self {
             child: None,
             child_hwnd: None,
             embedded: true,
-            ipc_path: r"\\.\pipe\mpv-ipc".to_string(),
+            ipc_path: format!(r"\\.\pipe\mpv-ipc-{}", pipe_id),
+            last_rect: None,
+            last_visible: false,
         }
     }
 
@@ -137,15 +141,22 @@ impl MpvPlayer {
         }
     }
 
-    fn set_visible(&self, visible: bool) {
+    fn set_visible(&mut self, visible: bool) {
+        if self.last_visible == visible {
+            return;
+        }
         if let Some(hwnd) = self.child_hwnd {
             unsafe {
                 ShowWindow(hwnd as _, if visible { SW_SHOW } else { SW_HIDE });
             }
+            self.last_visible = visible;
         }
     }
 
-    fn move_window(&self, rect: egui::Rect, pixels_per_point: f32) {
+    fn move_window(&mut self, rect: egui::Rect, pixels_per_point: f32) {
+        if self.last_rect == Some(rect) {
+            return;
+        }
         if let Some(hwnd) = self.child_hwnd {
             unsafe {
                 MoveWindow(
@@ -157,6 +168,7 @@ impl MpvPlayer {
                     1,
                 );
             }
+            self.last_rect = Some(rect);
         }
     }
 
@@ -1029,18 +1041,10 @@ impl eframe::App for App {
 
             if self.player.embedded && player_active {
                 let available = ui.available_size();
-                let (rect, response) = ui.allocate_at_least(
+                let (rect, _response) = ui.allocate_at_least(
                     egui::vec2(available.x, available.y.max(300.0)),
-                    egui::Sense::click(),
+                    egui::Sense::hover(),
                 );
-
-                if response.clicked() {
-                    if let Some(hwnd) = self.player.child_hwnd {
-                        unsafe {
-                            SetFocus(hwnd as _);
-                        }
-                    }
-                }
 
                 self.player.move_window(rect, ctx.pixels_per_point());
                 self.player.set_visible(true);
@@ -1049,13 +1053,17 @@ impl eframe::App for App {
             }
 
             ui.separator();
+            ui.separator();
             ui.add_space(4.0);
-            let is_err = self.status.to_lowercase().contains("eroare");
-            ui.colored_label(
-                if is_err { Color32::RED } else { Color32::GREEN },
-                &self.status,
-            );
+            ui.horizontal(|ui| {
+                let is_err = self.status.to_lowercase().contains("eroare");
+                ui.colored_label(
+                    if is_err { Color32::RED } else { Color32::GREEN },
+                    &self.status,
+                );
+            });
             ui.add_space(4.0);
+            ui.separator();
             ui.separator();
         });
 
