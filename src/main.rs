@@ -22,6 +22,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetWindowLongW, MoveWindow, SetWindowLongW, ShowWindow, GWL_STYLE,
     SW_HIDE, SW_SHOW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_CONTROLPARENT, SetWindowPos,
 };
 
 // ---------------------------- Data model ----------------------------
@@ -124,10 +125,10 @@ impl MpvPlayer {
             unsafe {
                 let class_name: Vec<u16> = "Static\0".encode_utf16().collect();
                 let hwnd = CreateWindowExW(
-                    0,
+                    WS_EX_CONTROLPARENT,
                     class_name.as_ptr(),
                     std::ptr::null(),
-                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | 0x100, // 0x100 = SS_NOTIFY
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                     0,
                     0,
                     0,
@@ -157,22 +158,30 @@ impl MpvPlayer {
     }
 
     fn move_window(&mut self, rect: egui::Rect, pixels_per_point: f32) {
-        if self.last_rect == Some(rect) && self.last_ppp == Some(pixels_per_point) {
-            return;
-        }
         if let Some(hwnd) = self.child_hwnd {
-            unsafe {
-                MoveWindow(
-                    hwnd as _,
-                    (rect.min.x * pixels_per_point) as i32,
-                    (rect.min.y * pixels_per_point) as i32,
-                    (rect.width() * pixels_per_point) as i32,
-                    (rect.height() * pixels_per_point) as i32,
-                    1,
-                );
+            if self.last_rect != Some(rect) || self.last_ppp != Some(pixels_per_point) {
+                unsafe {
+                    MoveWindow(
+                        hwnd as _,
+                        (rect.min.x * pixels_per_point) as i32,
+                        (rect.min.y * pixels_per_point) as i32,
+                        (rect.width() * pixels_per_point) as i32,
+                        (rect.height() * pixels_per_point) as i32,
+                        1,
+                    );
+                    SetWindowPos(
+                        hwnd as _,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                    );
+                }
+                self.last_rect = Some(rect);
+                self.last_ppp = Some(pixels_per_point);
             }
-            self.last_rect = Some(rect);
-            self.last_ppp = Some(pixels_per_point);
         }
     }
 
@@ -1055,7 +1064,7 @@ impl eframe::App for App {
                 let available = ui.available_size();
                 let (rect, _response) = ui.allocate_at_least(
                     egui::vec2(available.x, available.y.max(300.0)),
-                    egui::Sense::hover(),
+                    egui::Sense { click: false, drag: false, focusable: false },
                 );
 
                 if ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_pressed()) {
@@ -1072,6 +1081,7 @@ impl eframe::App for App {
                 self.player.set_visible(false);
             }
 
+            ui.add_space(4.0);
             ui.separator();
             ui.separator();
             ui.add_space(4.0);
@@ -1079,12 +1089,13 @@ impl eframe::App for App {
                 let is_err = self.status.to_lowercase().contains("eroare");
                 ui.colored_label(
                     if is_err { Color32::RED } else { Color32::GREEN },
-                    &self.status,
+                    format!("Status: {}", self.status),
                 );
             });
             ui.add_space(4.0);
             ui.separator();
             ui.separator();
+            ui.add_space(4.0);
         });
 
         // Dialog M3U (fără borrow conflict pe open)
