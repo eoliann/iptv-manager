@@ -18,11 +18,14 @@ use std::{
 use uuid::Uuid;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GetWindowLongW, MoveWindow, SetWindowLongW, ShowWindow, GWL_STYLE,
-    SW_HIDE, SW_SHOW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
-    HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_CONTROLPARENT, SetWindowPos,
+    SW_HIDE, SW_SHOW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+    WS_POPUP, WS_EX_TOOLWINDOW,
 };
 
 // ---------------------------- Data model ----------------------------
@@ -125,10 +128,10 @@ impl MpvPlayer {
             unsafe {
                 let class_name: Vec<u16> = "Static\0".encode_utf16().collect();
                 let hwnd = CreateWindowExW(
-                    WS_EX_CONTROLPARENT,
+                    WS_EX_TOOLWINDOW,
                     class_name.as_ptr(),
                     std::ptr::null(),
-                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                     0,
                     0,
                     0,
@@ -157,14 +160,20 @@ impl MpvPlayer {
         }
     }
 
-    fn move_window(&mut self, rect: egui::Rect, pixels_per_point: f32) {
+    fn move_window(&mut self, parent_hwnd: isize, rect: egui::Rect, pixels_per_point: f32) {
         if let Some(hwnd) = self.child_hwnd {
             if self.last_rect != Some(rect) || self.last_ppp != Some(pixels_per_point) {
                 unsafe {
+                    let mut pt = POINT {
+                        x: (rect.min.x * pixels_per_point) as i32,
+                        y: (rect.min.y * pixels_per_point) as i32,
+                    };
+                    ClientToScreen(parent_hwnd as _, &mut pt);
+
                     MoveWindow(
                         hwnd as _,
-                        (rect.min.x * pixels_per_point) as i32,
-                        (rect.min.y * pixels_per_point) as i32,
+                        pt.x,
+                        pt.y,
                         (rect.width() * pixels_per_point) as i32,
                         (rect.height() * pixels_per_point) as i32,
                         1,
@@ -1064,25 +1073,38 @@ impl eframe::App for App {
                 let available = ui.available_size();
                 let (rect, _response) = ui.allocate_at_least(
                     egui::vec2(available.x, available.y.max(300.0)),
-                    egui::Sense { click: false, drag: false, focusable: false },
+                    egui::Sense {
+                        click: false,
+                        drag: false,
+                        focusable: false,
+                    },
                 );
 
-                if ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_pressed()) {
-                    if let Some(hwnd) = self.player.child_hwnd {
-                        unsafe {
-                            SetFocus(hwnd as _);
+                if let Ok(handle) = _frame.window_handle() {
+                    if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                        let parent_hwnd = h.hwnd.get();
+
+                        if ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_pressed()) {
+                            if let Some(hwnd) = self.player.child_hwnd {
+                                unsafe {
+                                    SetFocus(hwnd as _);
+                                }
+                            }
                         }
+
+                        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+                        self.player
+                            .move_window(parent_hwnd, rect, ctx.pixels_per_point());
+                        self.player.set_visible(!minimized);
                     }
                 }
-
-                self.player.move_window(rect, ctx.pixels_per_point());
-                self.player.set_visible(true);
             } else {
                 self.player.set_visible(false);
             }
 
             ui.add_space(4.0);
             ui.separator();
+            ui.add_space(1.0);
             ui.separator();
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1094,6 +1116,7 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
             ui.separator();
+            ui.add_space(1.0);
             ui.separator();
             ui.add_space(4.0);
         });
