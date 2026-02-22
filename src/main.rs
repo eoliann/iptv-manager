@@ -3,19 +3,29 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use eframe::egui;
-use egui::{Align2, Color32};
+use egui::{Align2, Color32, RichText};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     sync::mpsc,
     thread,
     time::Duration,
 };
 use uuid::Uuid;
-use std::io::{Read, Write};
+
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, GetWindow, GetWindowLongW, MoveWindow, SetWindowLongW, ShowWindow,
+    GWL_STYLE, GW_CHILD, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE, WS_EX_CONTROLPARENT, SetWindowPos,
+};
+
+const SS_NOTIFY: u32 = 0x0100;
 
 // ---------------------------- Data model ----------------------------
 
@@ -53,12 +63,23 @@ struct AppData {
 
 // ---------------------------- Background jobs ----------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MpvStatus {
+    Unknown,
+    Checking,
+    UpToDate,
+    UpdateAvailable,
+    NotInstalled,
+}
+
+#[derive(Debug)]
 enum JobMsg {
     Status(String),
     Progress { current: u64, total: Option<u64> },
     Done(String),
     Error(String),
+    MpvStatus(MpvStatus),
+    MpvStarted(Child),
 }
 
 struct RunningJob {
@@ -67,11 +88,128 @@ struct RunningJob {
 
 // ---------------------------- App state ----------------------------
 
+struct MpvPlayer {
+    child: Option<Child>,
+    child_hwnd: Option<isize>,
+    embedded: bool,
+    ipc_path: String,
+    last_rect: Option<egui::Rect>,
+    last_ppp: Option<f32>,
+    last_visible: bool,
+}
+
+impl MpvPlayer {
+    fn new() -> Self {
+        let pipe_id = Uuid::new_v4().to_string();
+        Self {
+            child: None,
+            child_hwnd: None,
+            embedded: true,
+            ipc_path: format!(r"\\.\pipe\mpv-ipc-{}", pipe_id),
+            last_rect: None,
+            last_ppp: None,
+            last_visible: false,
+        }
+    }
+
+    fn send_command(&self, cmd: &str) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.ipc_path)
+            .context("Nu pot deschide pipe-ul MPV")?;
+        file.write_all(cmd.as_bytes())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn ensure_child_window(&mut self, parent_hwnd: isize) {
+        if self.child_hwnd.is_none() {
+            unsafe {
+                let class_name: Vec<u16> = "Static\0".encode_utf16().collect();
+                let hwnd = CreateWindowExW(
+                    WS_EX_CONTROLPARENT,
+                    class_name.as_ptr(),
+                    std::ptr::null(),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS | SS_NOTIFY,
+                    0,
+                    0,
+                    0,
+                    0,
+                    parent_hwnd as _,
+                    0,
+                    0,
+                    std::ptr::null(),
+                );
+                if hwnd != 0 {
+                    self.child_hwnd = Some(hwnd as _);
+                }
+            }
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        if self.last_visible == visible {
+            return;
+        }
+        if let Some(hwnd) = self.child_hwnd {
+            unsafe {
+                ShowWindow(hwnd as _, if visible { SW_SHOW } else { SW_HIDE });
+            }
+            self.last_visible = visible;
+        }
+    }
+
+    fn move_window(&mut self, rect: egui::Rect, pixels_per_point: f32) {
+        if let Some(hwnd) = self.child_hwnd {
+            unsafe {
+                if self.last_rect != Some(rect) || self.last_ppp != Some(pixels_per_point) {
+                    MoveWindow(
+                        hwnd as _,
+                        (rect.min.x * pixels_per_point) as i32,
+                        (rect.min.y * pixels_per_point) as i32,
+                        (rect.width() * pixels_per_point) as i32,
+                        (rect.height() * pixels_per_point) as i32,
+                        1,
+                    );
+                    self.last_rect = Some(rect);
+                    self.last_ppp = Some(pixels_per_point);
+                }
+                // Always ensure it's on top of the GL surface
+                SetWindowPos(
+                    hwnd as _,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+
+    fn is_alive(&mut self) -> bool {
+        if let Some(child) = &mut self.child {
+            match child.try_wait() {
+                Ok(None) => true,
+                _ => {
+                    self.child = None;
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+}
+
 struct App {
     data: AppData,
     data_path: PathBuf,
     playlists_dir: PathBuf,
     mpv_dir: PathBuf,
+    mpv_status: MpvStatus,
+    player: MpvPlayer,
 
     selected_id: Option<String>,
 
@@ -116,11 +254,13 @@ impl App {
             .and_then(|s| serde_json::from_str::<AppData>(&s).ok())
             .unwrap_or_default();
 
-        Self {
+        let mut app = Self {
             data,
             data_path,
             playlists_dir,
             mpv_dir,
+            mpv_status: MpvStatus::Unknown,
+            player: MpvPlayer::new(),
 
             selected_id: None,
 
@@ -141,7 +281,9 @@ impl App {
             form_portal: String::new(),
             form_mac: String::new(),
             form_mag_pass: String::new(),
-        }
+        };
+        app.start_check_mpv_status();
+        app
     }
 
     // ---------------------------- helpers ----------------------------
@@ -349,6 +491,144 @@ impl App {
         thread::spawn(move || f(tx));
     }
 
+    fn start_check_mpv_status(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+
+        self.mpv_status = MpvStatus::Checking;
+        let mpv_dir = self.mpv_dir.clone();
+
+        self.start_job(move |tx| {
+            let res = (|| -> Result<()> {
+                let client = Self::http_client()?;
+                let (latest_version, _) = Self::fetch_latest_mpv_info(&client)?;
+
+                let mpv_exe = Self::mpv_exe_path(&mpv_dir);
+                if !mpv_exe.exists() {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::NotInstalled));
+                    return Ok(());
+                }
+
+                let installed_version =
+                    Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
+                if installed_version == latest_version {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate));
+                } else {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::UpdateAvailable));
+                }
+                Ok(())
+            })();
+
+            if let Err(_) = res {
+                let exe = Self::mpv_exe_path(&mpv_dir);
+                if !exe.exists() {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::NotInstalled));
+                } else {
+                    let _ = tx.send(JobMsg::MpvStatus(MpvStatus::Unknown));
+                }
+            }
+            let _ = tx.send(JobMsg::Done("Verificare MPV finalizată.".to_string()));
+        });
+    }
+
+    fn download_and_extract_mpv(
+        client: &Client,
+        download_url: &str,
+        mpv_dir: &Path,
+        latest_version: &str,
+        tx: &mpsc::Sender<JobMsg>,
+    ) -> Result<PathBuf> {
+        tx.send(JobMsg::Status(format!("Descarc mpv: {}...", latest_version)))
+            .ok();
+        fs::create_dir_all(mpv_dir)?;
+        let archive_path = mpv_dir.join("mpv.7z");
+
+        let mut resp = client.get(download_url).send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("HTTP {} la mpv", resp.status()));
+        }
+
+        let mut file = fs::File::create(&archive_path)?;
+        let total = resp.content_length();
+        let mut downloaded: u64 = 0;
+        let mut buf = [0u8; 64 * 1024];
+
+        while let Ok(n) = resp.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
+            downloaded += n as u64;
+            tx.send(JobMsg::Progress {
+                current: downloaded,
+                total,
+            })
+            .ok();
+        }
+
+        tx.send(JobMsg::Status("Extrag mpv...".into())).ok();
+        sevenz_rust::decompress_file(&archive_path, mpv_dir)
+            .map_err(|e| anyhow!("Eroare extragere: {e}"))?;
+
+        fs::remove_file(&archive_path).ok();
+        fs::write(Self::mpv_version_file(mpv_dir), latest_version).ok();
+        tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate)).ok();
+
+        Self::find_file_recursive(mpv_dir, "mpv.exe", 6)
+            .ok_or_else(|| anyhow!("Nu găsesc mpv.exe după extragere"))
+    }
+
+    fn start_mpv_maintenance_job(&mut self) {
+        if self.is_busy() {
+            return;
+        }
+
+        let mpv_dir = self.mpv_dir.clone();
+
+        self.start_job(move |tx| {
+            if let Err(e) = (|| -> Result<()> {
+                let client = Self::http_client()?;
+
+                tx.send(JobMsg::Status("Verific mpv...".into())).ok();
+
+                let mpv_exe = Self::mpv_exe_path(&mpv_dir);
+                let existed_before = mpv_exe.exists();
+
+                let (latest_version, download_url) = Self::fetch_latest_mpv_info(&client)?;
+                let installed_version =
+                    Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
+
+                if existed_before && installed_version == latest_version {
+                    tx.send(JobMsg::MpvStatus(MpvStatus::UpToDate)).ok();
+                    tx.send(JobMsg::Done("MPV este deja la zi.".into())).ok();
+                    return Ok(());
+                }
+
+                let exe =
+                    Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?;
+
+                // Daca nu era instalat, il rulam dupa descarcare
+                if !existed_before {
+                    tx.send(JobMsg::Status("Pornesc mpv...".into())).ok();
+                    let _ = Command::new(exe)
+                        .arg("--osc=yes")
+                        .arg("--script-opts=osc-visibility=always")
+                        .arg("--input-cursor=yes")
+                        .arg("--input-vo-keyboard=yes")
+                        .arg("--input-default-bindings=yes")
+                        .spawn();
+                }
+
+                tx.send(JobMsg::Done("Acțiune MPV finalizată.".into()))
+                    .ok();
+                Ok(())
+            })() {
+                tx.send(JobMsg::Error(e.to_string())).ok();
+            }
+        });
+    }
+
     fn poll_job_messages(&mut self) {
         // take ownership -> no borrow conflicts
         let job = match self.job.take() {
@@ -358,16 +638,26 @@ impl App {
 
         let mut done: Option<String> = None;
         let mut err: Option<String> = None;
+        let mut disconnected = false;
 
-        while let Ok(msg) = job.rx.try_recv() {
-            match msg {
-                JobMsg::Status(s) => self.status = s,
-                JobMsg::Progress { current, total } => {
-                    self.progress_current = current;
-                    self.progress_total = total;
+        loop {
+            match job.rx.try_recv() {
+                Ok(msg) => match msg {
+                    JobMsg::Status(s) => self.status = s,
+                    JobMsg::Progress { current, total } => {
+                        self.progress_current = current;
+                        self.progress_total = total;
+                    }
+                    JobMsg::Done(s) => done = Some(s),
+                    JobMsg::Error(e) => err = Some(e),
+                    JobMsg::MpvStatus(s) => self.mpv_status = s,
+                    JobMsg::MpvStarted(c) => self.player.child = Some(c),
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
-                JobMsg::Done(s) => done = Some(s),
-                JobMsg::Error(e) => err = Some(e),
             }
         }
 
@@ -385,15 +675,22 @@ impl App {
             return;
         }
 
+        if disconnected {
+            self.reset_progress();
+            self.job = None;
+            return;
+        }
+
         self.job = Some(job);
     }
 
-    fn fetch_latest_mpv_asset_url(client: &Client) -> Result<String> {
+    fn fetch_latest_mpv_info(client: &Client) -> Result<(String, String)> {
         let api_url = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest";
 
         let resp = client
             .get(api_url)
             .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "iptv-manager")
             .send()
             .context("Nu pot interoga GitHub API")?;
 
@@ -401,8 +698,7 @@ impl App {
             return Err(anyhow!("HTTP {} la GitHub API", resp.status()));
         }
 
-        let text = resp.text().context("Nu pot citi corpul răspunsului GitHub")?;
-        let json: serde_json::Value = serde_json::from_str(&text).context("JSON invalid GitHub")?;
+        let json: serde_json::Value = resp.json().context("JSON invalid GitHub")?;
 
         let assets = json["assets"]
             .as_array()
@@ -412,18 +708,8 @@ impl App {
             let name = asset["name"].as_str().unwrap_or("");
             let url = asset["browser_download_url"].as_str().unwrap_or("");
 
-            // if name.starts_with("mpv-")
-            //     && name.contains("x86_64")
-            //     && name.ends_with(".7z")
-            // {
-            //     return Ok(url.to_string());
-            // }
-            if name.starts_with("mpv-")
-                && !name.contains("ffmpeg")
-                && name.contains("x86_64")
-                && name.ends_with(".7z")
-            {
-                return Ok(url.to_string());
+            if name.contains("mpv-x86_64") && name.ends_with(".7z") && !name.contains("ffmpeg") {
+                return Ok((name.to_string(), url.to_string()));
             }
         }
 
@@ -501,95 +787,64 @@ impl App {
             return;
         }
 
+        // Check if alive first (need to do it before moving player to thread)
+        let mut is_alive = self.player.is_alive();
+        let ipc_path = self.player.ipc_path.clone();
+        let embedded = self.player.embedded;
+        let wid = self.player.child_hwnd;
+
         self.start_job(move |tx| {
             if let Err(e) = (|| -> Result<()> {
+                let client = Self::http_client()?;
 
-                let client = Client::builder()
-                    .user_agent("iptv-manager")
-                    .build()?;
+                tx.send(JobMsg::Status("Verific mpv...".into())).ok();
+                let (latest_version, download_url) = Self::fetch_latest_mpv_info(&client)?;
 
-                tx.send(JobMsg::Status("Caut ultima versiune mpv...".into())).ok();
+                let mpv_exe_local = Self::mpv_exe_path(&mpv_dir);
+                let installed_version =
+                    Self::read_installed_mpv_version(&mpv_dir).unwrap_or_default();
 
-                // 1️⃣ GitHub API latest release
-                let api_url = "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest";
+                let mpv_exe = if mpv_exe_local.exists() && installed_version == latest_version {
+                    mpv_exe_local
+                } else {
+                    let exe = Self::download_and_extract_mpv(&client, &download_url, &mpv_dir, &latest_version, &tx)?;
+                    is_alive = false; // forced new spawn if updated
+                    exe
+                };
 
-                let release: serde_json::Value = client
-                    .get(api_url)
-                    .send()?
-                    .json()?;
+                if is_alive {
+                    tx.send(JobMsg::Status("Încarc playlist în MPV existent...".into())).ok();
+                    let file_arg = playlist_path.to_string_lossy().replace("\\", "\\\\");
+                    let cmd = format!("{{\"command\": [\"loadfile\", \"{}\"]}}", file_arg);
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&ipc_path)
+                        .context("Nu pot deschide pipe-ul MPV")?;
+                    file.write_all(cmd.as_bytes())?;
+                    file.write_all(b"\n")?;
+                } else {
+                    tx.send(JobMsg::Status("Pornesc MPV...".into())).ok();
+                    let mut cmd = Command::new(mpv_exe);
+                    cmd.arg(playlist_path)
+                       .arg("--force-window=yes")
+                       .arg("--osc=yes")
+                       .arg("--script-opts=osc-visibility=always")
+                       .arg("--input-cursor=yes")
+                       .arg("--input-vo-keyboard=yes")
+                       .arg("--input-default-bindings=yes")
+                       .arg(format!("--input-ipc-server={}", ipc_path));
 
-                let assets = release["assets"]
-                    .as_array()
-                    .ok_or_else(|| anyhow!("Nu pot citi assets din release"))?;
-
-                // 2️⃣ Caut asset corect
-                let mut download_url: Option<String> = None;
-
-                for asset in assets {
-                    if let Some(name) = asset["name"].as_str() {
-                        if name.contains("mpv-x86_64") && name.ends_with(".7z") {
-                            download_url = asset["browser_download_url"]
-                                .as_str()
-                                .map(|s| s.to_string());
-                            break;
+                    if embedded {
+                        if let Some(w) = wid {
+                            cmd.arg(format!("--wid={}", w));
                         }
                     }
+
+                    let child = cmd.spawn()?;
+                    let _ = tx.send(JobMsg::MpvStarted(child));
                 }
-
-                let download_url = download_url
-                    .ok_or_else(|| anyhow!("Nu găsesc arhiva mpv-x86_64 în release"))?;
-
-                tx.send(JobMsg::Status("Descarc mpv...".into())).ok();
-
-                fs::create_dir_all(&mpv_dir)?;
-
-                let archive_path = mpv_dir.join("mpv.7z");
-
-                let mut resp = client.get(&download_url).send()?;
-
-                if !resp.status().is_success() {
-                    return Err(anyhow!("HTTP {} la mpv", resp.status()));
-                }
-
-                let mut file = fs::File::create(&archive_path)?;
-
-                let total = resp.content_length();
-                let mut downloaded: u64 = 0;
-                let mut buf = [0u8; 64 * 1024];
-
-                while let Ok(n) = resp.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    file.write_all(&buf[..n])?;
-                    downloaded += n as u64;
-
-                    tx.send(JobMsg::Progress {
-                        current: downloaded,
-                        total,
-                    }).ok();
-                }
-
-                tx.send(JobMsg::Status("Extrag mpv...".into())).ok();
-
-                sevenz_rust::decompress_file(&archive_path, &mpv_dir)
-                    .map_err(|e| anyhow!("Eroare extragere: {e}"))?;
-
-                fs::remove_file(&archive_path).ok();
-
-                // 3️⃣ Caut mpv.exe
-                let mpv_exe = Self::find_file_recursive(&mpv_dir, "mpv.exe", 6)
-                    .ok_or_else(|| anyhow!("Nu găsesc mpv.exe după extragere"))?;
-
-                tx.send(JobMsg::Status("Pornesc redarea...".into())).ok();
-
-                Command::new(mpv_exe)
-                    .arg(playlist_path)
-                    .arg("--force-window=yes")
-                    .spawn()?;
 
                 tx.send(JobMsg::Done("Redare pornită.".into())).ok();
-
                 Ok(())
             })() {
                 tx.send(JobMsg::Error(e.to_string())).ok();
@@ -652,6 +907,21 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_job_messages();
 
+        if let Ok(handle) = _frame.window_handle() {
+            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                let hwnd = h.hwnd.get();
+                self.player.ensure_child_window(hwnd);
+
+                // Add WS_CLIPCHILDREN to main window to prevent flickering and event issues
+                unsafe {
+                    let style = GetWindowLongW(hwnd as _, GWL_STYLE);
+                    if style & WS_CLIPCHILDREN as i32 == 0 {
+                        SetWindowLongW(hwnd as _, GWL_STYLE, style | WS_CLIPCHILDREN as i32);
+                    }
+                }
+            }
+        }
+
         egui::TopBottomPanel::top("top_menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("Adaugă", |ui| {
@@ -668,6 +938,30 @@ impl eframe::App for App {
                         ui.close_menu();
                     }
                 });
+
+                ui.separator();
+
+                let (btn_text, use_custom_style) = match self.mpv_status {
+                    MpvStatus::NotInstalled => ("Instalează MPV", true),
+                    MpvStatus::UpdateAvailable => ("Actualizează MPV", true),
+                    MpvStatus::Checking => ("Verificare MPV...", false),
+                    MpvStatus::UpToDate => ("MPV este la zi", false),
+                    MpvStatus::Unknown => ("Verifică MPV", false),
+                };
+
+                let mut btn = egui::Button::new(if use_custom_style {
+                    RichText::new(btn_text).color(Color32::BLACK)
+                } else {
+                    RichText::new(btn_text)
+                });
+
+                if use_custom_style {
+                    btn = btn.fill(Color32::GREEN);
+                }
+
+                if ui.add_enabled(!self.is_busy(), btn).clicked() {
+                    self.start_mpv_maintenance_job();
+                }
             });
         });
 
@@ -717,6 +1011,30 @@ impl eframe::App for App {
                     }
                 });
 
+                ui.separator();
+
+                if ui
+                    .button(if self.player.embedded {
+                        "Mod Extern"
+                    } else {
+                        "Mod Embed"
+                    })
+                    .clicked()
+                {
+                    self.player.embedded = !self.player.embedded;
+                    if let Some(hwnd) = self.player.child_hwnd {
+                        let wid = if self.player.embedded { hwnd } else { 0 };
+                        let _ = self.player.send_command(&format!(
+                            "{{\"command\": [\"set_property\", \"wid\", {}]}}",
+                            wid
+                        ));
+                    }
+                }
+
+                if ui.button("Fullscreen").clicked() {
+                    let _ = self.player.send_command("{\"command\": [\"cycle\", \"fullscreen\"]}");
+                }
+
                 if self.is_busy() {
                     ui.spinner();
                 }
@@ -744,11 +1062,51 @@ impl eframe::App for App {
 
             ui.separator();
 
-            let is_err = self.status.to_lowercase().contains("eroare");
-            ui.colored_label(
-                if is_err { Color32::RED } else { Color32::GREEN },
-                &self.status,
-            );
+            let player_active = self.player.is_alive();
+
+            if self.player.embedded && player_active {
+                let available = ui.available_size();
+                let (rect, response) = ui.allocate_at_least(
+                    egui::vec2(available.x, available.y.max(300.0)),
+                    egui::Sense::click(),
+                );
+
+                if response.clicked() || (ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_pressed())) {
+                    if let Some(hwnd) = self.player.child_hwnd {
+                        unsafe {
+                            let mpv_hwnd = GetWindow(hwnd as _, GW_CHILD);
+                            if mpv_hwnd != 0 {
+                                SetFocus(mpv_hwnd as _);
+                            } else {
+                                SetFocus(hwnd as _);
+                            }
+                        }
+                    }
+                }
+
+                self.player.move_window(rect, ctx.pixels_per_point());
+                self.player.set_visible(true);
+            } else {
+                self.player.set_visible(false);
+            }
+
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(1.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let is_err = self.status.to_lowercase().contains("eroare");
+                ui.colored_label(
+                    if is_err { Color32::RED } else { Color32::GREEN },
+                    format!("Status: {}", self.status),
+                );
+            });
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(1.0);
+            ui.separator();
+            ui.add_space(4.0);
         });
 
         // Dialog M3U (fără borrow conflict pe open)
@@ -888,8 +1246,19 @@ impl eframe::App for App {
             }
         }
 
-        if self.is_busy() {
+        if self.is_busy() || self.player.is_alive() {
             ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut child) = self.player.child.take() {
+            let _ = child.kill();
+        }
+        if let Some(hwnd) = self.player.child_hwnd {
+            unsafe {
+                DestroyWindow(hwnd as _);
+            }
         }
     }
 }
